@@ -1,0 +1,155 @@
+diff --git a/makefile.unix b/makefile.unix
+index 857ea988..3d98c67f 100644
+--- a/makefile.unix
++++ b/makefile.unix
+@@ -108,12 +108,12 @@ AR = ar
+ ARFLAGS = r
+ CPPFLAGS = -I. -Isrc/ -Wall
+ ifeq ($(DEBUG), 1)
+-  CFLAGS = -g
++  CFLAGS = -ggdb -Og
+ else
+-  CFLAGS = -O3 -DNDEBUG
++  CFLAGS = -O3 -ggdb -DNDEBUG
+ endif
+ CFLAGS += $(EXTRA_FLAGS)
+-CC = gcc
++CC = clang
+ INSTALL = install
+ GROFF = /usr/bin/groff
+ COL = /usr/bin/col
+diff --git a/src/utils/huffman_utils.c b/src/utils/huffman_utils.c
+index 90c2fbf7..a586870d 100644
+--- a/src/utils/huffman_utils.c
++++ b/src/utils/huffman_utils.c
+@@ -50,7 +50,7 @@ static WEBP_INLINE uint32_t GetNextKey(uint32_t key, int len) {
+ 
+ // Stores code in table[0], table[step], table[2*step], ..., table[end].
+ // Assumes that end is an integer multiple of step.
+-static WEBP_INLINE void ReplicateValue(HuffmanCode* table,
++__attribute__ ((noinline)) void ReplicateValue(HuffmanCode* table,
+                                        int step, int end,
+                                        HuffmanCode code) {
+   assert(end % step == 0);
+diff --git a/tests/fuzzer/simple_api_fuzzer.c b/tests/fuzzer/simple_api_fuzzer.c
+index 7d2b7f81..309963fc 100644
+--- a/tests/fuzzer/simple_api_fuzzer.c
++++ b/tests/fuzzer/simple_api_fuzzer.c
+@@ -14,10 +14,116 @@
+ //
+ ////////////////////////////////////////////////////////////////////////////////
+ 
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/mman.h>
++
+ #include "./fuzz_utils.h"
+ #include "src/webp/decode.h"
+ 
+-int LLVMFuzzerTestOneInput(const uint8_t* const data, size_t size) {
++#define NO_SANITIZE                                  \
++  __attribute__((disable_sanitizer_instrumentation)) \
++  __attribute__((no_sanitize("coverage")))
++#define NO_INLINE __attribute__((noinline))
++
++#define MAX_ALLOCS (1024)
++#define PAGE_SIZE (0x1000)
++
++NO_INLINE NO_SANITIZE void* custom_memset(void* dst, int c, size_t n) {
++  volatile uint8_t* volatile_dst = (volatile uint8_t*)dst;
++  for (size_t i = 0; i < n; i++) {
++    volatile_dst[i] = c;
++  }
++  return dst;
++}
++
++NO_INLINE NO_SANITIZE void* custom_memcpy(void* dst, void* src, size_t n) {
++  volatile uint8_t* volatile_dst = (volatile uint8_t*)dst;
++  volatile uint8_t* volatile_src = (volatile uint8_t*)src;
++  for (size_t i = 0; i < n; i++) {
++    volatile_dst[i] = volatile_src[i];
++  }
++  return dst;
++}
++
++NO_INLINE NO_SANITIZE int custom_memcmp(void* s1, void* s2, size_t n) {
++  volatile uint8_t* volatile_s1 = (volatile uint8_t*)s1;
++  volatile uint8_t* volatile_s2 = (volatile uint8_t*)s2;
++  for (size_t i = 0; i < n; i++) {
++    if (volatile_s1[i] < volatile_s2[i]) return -1;
++    if (volatile_s1[i] > volatile_s2[i]) return 1;
++  }
++  return 0;
++}
++
++uintptr_t g_custom_malloc_start = 0;
++uintptr_t g_custom_malloc_next_addr = 0;
++size_t g_custom_malloc_alloc_idx = 0;
++uintptr_t g_custom_malloc_allocs[MAX_ALLOCS] = {0};
++size_t g_custom_malloc_alloc_sizes[MAX_ALLOCS] = {0};
++
++NO_INLINE NO_SANITIZE void* custom_malloc(size_t size) {
++  size_t roundup_size = (size + PAGE_SIZE) & ~(PAGE_SIZE - 1);
++  if (g_custom_malloc_alloc_idx == MAX_ALLOCS) {
++    __builtin_trap();
++  }
++
++  if (g_custom_malloc_next_addr + roundup_size >=
++      g_custom_malloc_start * (MAX_ALLOCS * PAGE_SIZE)) {
++    __builtin_trap();
++  }
++
++  void* addr = (void*)g_custom_malloc_next_addr;
++
++  g_custom_malloc_allocs[g_custom_malloc_alloc_idx] = g_custom_malloc_next_addr;
++  g_custom_malloc_alloc_sizes[g_custom_malloc_alloc_idx] = size;
++
++  g_custom_malloc_next_addr += roundup_size;
++  g_custom_malloc_alloc_idx += 1;
++  return addr;
++}
++
++NO_INLINE NO_SANITIZE void* custom_calloc(size_t n, size_t m) {
++  void* alloc = custom_malloc(n * m);
++  return custom_memset(alloc, '\0', n * m);
++}
++
++NO_INLINE NO_SANITIZE void custom_free(void* ptr) {
++  uintptr_t addr = (uintptr_t)ptr;
++
++  for (size_t i = 0; i < g_custom_malloc_alloc_idx; i++) {
++    uintptr_t alloc_start = g_custom_malloc_allocs[i];
++    size_t alloc_size = g_custom_malloc_alloc_sizes[i];
++    if (addr >= alloc_start && addr < alloc_size) {
++      return;
++    }
++  }
++
++  // Allocation not found.
++  __builtin_trap();
++}
++
++NO_INLINE NO_SANITIZE int custom_pthread_mutex_lock() { return 0; }
++
++NO_INLINE NO_SANITIZE int custom_pthread_mutex_unlock() { return 0; }
++
++int LLVMFuzzerInitialize(void) {
++  void* res = mmap(NULL, PAGE_SIZE * MAX_ALLOCS, PROT_READ | PROT_WRITE,
++                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++  if (res == MAP_FAILED) {
++    perror("mmap");
++    exit(EXIT_FAILURE);
++  }
++
++  g_custom_malloc_next_addr = (uintptr_t)res;
++  g_custom_malloc_start = (uintptr_t)res;
++  return 0;
++}
++
++NO_INLINE NO_SANITIZE int LLVMFuzzerTestOneInput(const uint8_t* const data,
++                                                 size_t size) {
+   int w, h;
+   if (!WebPGetInfo(data, size, &w, &h)) return 0;
+   if ((size_t)w * h > kFuzzPxLimit) return 0;
